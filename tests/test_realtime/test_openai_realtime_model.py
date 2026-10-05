@@ -18,8 +18,10 @@ from openai.types.realtime import (
 from openai.types.realtime.audio_transcription import AudioTranscription
 from openai.types.realtime.realtime_audio_input_turn_detection import ServerVad
 
-from livekit.agents import AgentSession, llm
+from livekit.agents import AgentSession, llm, utils
 from livekit.agents._exceptions import APIError
+from livekit.agents.llm._realtime import openai as _openai_impl
+from livekit.agents.llm._realtime.openai import _ResponseGeneration
 from livekit.agents.llm._realtime.openai_types import RealtimeModels as CoreRealtimeModels
 from livekit.agents.llm.remote_chat_context import RemoteChatContext
 from livekit.agents.metrics import STTMetrics
@@ -671,3 +673,91 @@ def test_transcription_audio_tokens_reach_session_usage_and_report() -> None:
             "output_tokens": 2,
         }
     ]
+
+
+# --- serialize_response_create (opt-in) --------------------------------------
+
+
+def _generate_reply_session(
+    *, serialize: bool, current_generation: object | None = None
+) -> tuple[RealtimeSession, list[object]]:
+    sent: list[object] = []
+    session = cast(
+        RealtimeSession,
+        SimpleNamespace(
+            _current_generation=current_generation,
+            _opts=SimpleNamespace(serialize_response_create=serialize),
+            _instructions=None,
+            _response_created_futures={},
+            _response_create_tasks=set(),
+            _discarded_event_ids=set(),
+            send_event=sent.append,
+        ),
+    )
+    return session, sent
+
+
+def _pending_generation() -> _ResponseGeneration:
+    return _ResponseGeneration(
+        message_ch=utils.aio.Chan(),
+        function_ch=utils.aio.Chan(),
+        messages={},
+        _done_fut=asyncio.Future(),
+        _created_timestamp=0.0,
+    )
+
+
+def _response_creates(sent: list[object]) -> list[object]:
+    return [e for e in sent if getattr(e, "type", None) == "response.create"]
+
+
+async def test_generate_reply_sends_immediately_by_default() -> None:
+    # flag OFF (default): response.create goes out synchronously even while a response is
+    # active — unchanged behaviour, the collision is left to the fast-fail path
+    session, sent = _generate_reply_session(
+        serialize=False, current_generation=_pending_generation()
+    )
+    RealtimeSession.generate_reply(session)
+    assert len(_response_creates(sent)) == 1
+    assert session._response_create_tasks == set()  # no deferred send spawned
+
+
+async def test_generate_reply_serialized_sends_immediately_without_active_response() -> None:
+    # flag ON but nothing active: no reason to wait, send right away
+    session, sent = _generate_reply_session(serialize=True, current_generation=None)
+    RealtimeSession.generate_reply(session)
+    assert len(_response_creates(sent)) == 1
+    assert session._response_create_tasks == set()
+
+
+async def test_generate_reply_waits_for_active_response_when_serialized() -> None:
+    # flag ON with an active response: hold response.create until it finishes, then send once
+    gen = _pending_generation()
+    session, sent = _generate_reply_session(serialize=True, current_generation=gen)
+
+    fut = RealtimeSession.generate_reply(session)
+    await asyncio.sleep(0)  # let the deferred send run its first step
+    assert _response_creates(sent) == []  # nothing sent while a response is active
+    assert not fut.done()
+
+    task = next(iter(session._response_create_tasks))
+    gen._done_fut.set_result(None)  # active response clears
+    await task
+
+    assert len(_response_creates(sent)) == 1  # sent exactly once, after the active one cleared
+
+
+async def test_generate_reply_serialize_falls_through_on_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # a stuck/never-done generation must not hang the reply forever: after the bounded wait
+    # we send anyway and let the fast-fail handle any resulting collision
+    monkeypatch.setattr(_openai_impl, "RESPONSE_CREATE_SERIALIZE_TIMEOUT", 0.02)
+    gen = _pending_generation()  # never resolved
+    session, sent = _generate_reply_session(serialize=True, current_generation=gen)
+
+    RealtimeSession.generate_reply(session)
+    task = next(iter(session._response_create_tasks))
+    await task  # waits out the bounded timeout, then sends
+
+    assert len(_response_creates(sent)) == 1
