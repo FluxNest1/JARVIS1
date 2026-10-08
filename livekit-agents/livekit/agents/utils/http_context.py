@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
+import functools
 import os
 import ssl
+import threading
 from collections.abc import AsyncIterator, Callable
 
 import aiohttp
@@ -13,6 +15,8 @@ from ..log import logger
 
 _ClientFactory = Callable[[], aiohttp.ClientSession]
 _ContextVar = contextvars.ContextVar[_ClientFactory | None]("agent_http_session")
+# held while a context is looked up or built, so concurrent first calls build one
+_ssl_context_lock = threading.Lock()
 
 
 def _has_system_trust_store() -> bool:
@@ -50,9 +54,19 @@ def _create_ssl_context() -> ssl.SSLContext:
     Falls back to certifi when no system trust store is resolvable (e.g. minimal
     containers without ca-certificates); ``SSL_CERT_FILE`` / ``SSL_CERT_DIR``
     take precedence.
+
+    Building a context parses the whole CA bundle, so the process builds one per
+    trust configuration and every job's session shares it. An ``SSLContext`` is
+    safe to share across threads and event loops. Like aiohttp's own default
+    context, it is not reloaded: a CA bundle replaced at the same path takes
+    effect when the process restarts.
     """
-    cafile = os.environ.get("SSL_CERT_FILE")
-    capath = os.environ.get("SSL_CERT_DIR")
+    with _ssl_context_lock:
+        return _ssl_context_for(os.environ.get("SSL_CERT_FILE"), os.environ.get("SSL_CERT_DIR"))
+
+
+@functools.cache
+def _ssl_context_for(cafile: str | None, capath: str | None) -> ssl.SSLContext:
     if cafile or capath:
         return ssl.create_default_context(cafile=cafile, capath=capath)
 

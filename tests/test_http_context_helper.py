@@ -7,6 +7,8 @@ from __future__ import annotations
 import asyncio
 import os
 import ssl
+import threading
+import time
 
 import aiohttp
 import certifi
@@ -77,6 +79,91 @@ async def test_http_session_error_message_points_to_helper() -> None:
         http_context.http_session()
     msg = str(exc_info.value)
     assert "http_context.open()" in msg
+
+
+@pytest.fixture(autouse=True)
+def _fresh_ssl_context_cache() -> None:
+    """Each test builds its context under its own env and verify paths."""
+    http_context._ssl_context_for.cache_clear()
+
+
+def test_ssl_context_is_built_once_per_trust_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every job's session reuses one context instead of parsing the CA bundle again."""
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
+    certifi_count = _certifi_cert_count()
+    built: list[ssl.SSLContext] = []
+    real_create = ssl.create_default_context
+
+    def _counting(*args: object, **kwargs: object) -> ssl.SSLContext:
+        built.append(real_create(*args, **kwargs))  # type: ignore[arg-type]
+        return built[-1]
+
+    monkeypatch.setattr(ssl, "create_default_context", _counting)
+
+    system_ctx = http_context._create_ssl_context()
+    assert http_context._create_ssl_context() is system_ctx
+    assert len(built) == 1
+
+    monkeypatch.setenv("SSL_CERT_FILE", certifi.where())
+    certifi_ctx = http_context._create_ssl_context()
+    assert certifi_ctx is not system_ctx
+    assert certifi_ctx.cert_store_stats()["x509"] == certifi_count
+    assert http_context._create_ssl_context() is certifi_ctx
+    assert len(built) == 2
+
+
+def test_concurrent_first_calls_build_one_ssl_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two jobs that start together share one context instead of each parsing the bundle."""
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
+    built: list[ssl.SSLContext] = []
+    first_entered, second_entered, second_waits, release = (threading.Event() for _ in range(4))
+    real_create = ssl.create_default_context
+
+    def _held_open(*args: object, **kwargs: object) -> ssl.SSLContext:
+        (second_entered if first_entered.is_set() else first_entered).set()
+        release.wait(timeout=10)
+        built.append(real_create(*args, **kwargs))  # type: ignore[arg-type]
+        return built[-1]
+
+    class _SignalingLock:
+        """The real lock, plus an event once a second caller is about to wait on it."""
+
+        def __init__(self) -> None:
+            self._lock = threading.Lock()
+
+        def __enter__(self) -> None:
+            if first_entered.is_set():
+                second_waits.set()
+            self._lock.acquire()
+
+        def __exit__(self, *exc: object) -> None:
+            self._lock.release()
+
+    monkeypatch.setattr(ssl, "create_default_context", _held_open)
+    monkeypatch.setattr(http_context, "_ssl_context_lock", _SignalingLock())
+
+    results: list[ssl.SSLContext] = []
+    first = threading.Thread(target=lambda: results.append(http_context._create_ssl_context()))
+    first.start()
+    assert first_entered.wait(timeout=10)
+    second = threading.Thread(target=lambda: results.append(http_context._create_ssl_context()))
+    second.start()
+    deadline = time.monotonic() + 10
+    while not (second_waits.is_set() or second_entered.is_set()):
+        assert time.monotonic() < deadline
+        second_waits.wait(timeout=0.01)
+    release.set()
+    first.join(timeout=10)
+    second.join(timeout=10)
+
+    assert len(built) == 1
+    assert results[0] is results[1]
 
 
 def _certifi_cert_count() -> int:
