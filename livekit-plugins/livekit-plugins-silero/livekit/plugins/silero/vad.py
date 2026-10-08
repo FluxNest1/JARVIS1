@@ -17,7 +17,7 @@ from __future__ import annotations
 import asyncio
 import time
 import weakref
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
 
@@ -49,6 +49,10 @@ class _VADOptions:
     sample_rate: int
 
 
+def _default_deactivation_threshold(activation_threshold: float) -> float:
+    return max(activation_threshold - 0.15, 0.01)
+
+
 class VAD(agents.vad.VAD):
     """
     Silero Voice Activity Detection (VAD) class.
@@ -71,7 +75,7 @@ class VAD(agents.vad.VAD):
         deactivation_threshold: NotGivenOr[float] = NOT_GIVEN,
         # deprecated
         padding_duration: NotGivenOr[float] = NOT_GIVEN,
-    ) -> agents.vad.VAD:
+    ) -> VAD:
         """
         Load and initialize the Silero VAD model.
 
@@ -81,6 +85,9 @@ class VAD(agents.vad.VAD):
         **Note:**
             This method is blocking and may take time to load the model into memory.
             It is recommended to call this method inside your prewarm mechanism.
+            Each call builds a new ONNX inference session, which holds the GIL while it
+            loads. To get a VAD with other options later, call `with_options` on the
+            loaded VAD instead: it reuses the same session.
 
         **Example:**
 
@@ -135,7 +142,8 @@ class VAD(agents.vad.VAD):
             prefix_padding_duration=prefix_padding_duration,
             max_buffered_speech=max_buffered_speech,
             activation_threshold=activation_threshold,
-            deactivation_threshold=deactivation_threshold or max(activation_threshold - 0.15, 0.01),
+            deactivation_threshold=deactivation_threshold
+            or _default_deactivation_threshold(activation_threshold),
             sample_rate=sample_rate,
         )
         return cls(session=session, opts=opts)
@@ -150,6 +158,78 @@ class VAD(agents.vad.VAD):
         self._onnx_session = session
         self._opts = opts
         self._streams = weakref.WeakSet[VADStream]()
+
+    def with_options(
+        self,
+        *,
+        min_speech_duration: NotGivenOr[float] = NOT_GIVEN,
+        min_silence_duration: NotGivenOr[float] = NOT_GIVEN,
+        prefix_padding_duration: NotGivenOr[float] = NOT_GIVEN,
+        max_buffered_speech: NotGivenOr[float] = NOT_GIVEN,
+        activation_threshold: NotGivenOr[float] = NOT_GIVEN,
+        deactivation_threshold: NotGivenOr[float] = NOT_GIVEN,
+        sample_rate: NotGivenOr[Literal[8000, 16000]] = NOT_GIVEN,
+    ) -> VAD:
+        """
+        Create a new VAD with other options on this VAD's ONNX inference session.
+
+        Unlike `load`, this method does not build a new session, so it returns without
+        blocking. Options that are not given keep this VAD's values. If `activation_threshold`
+        is given without `deactivation_threshold`, the deactivation threshold is derived from
+        it as in `load`. This VAD and its streams are not changed.
+
+        **Example:**
+
+            ```python
+            def prewarm(proc: JobProcess):
+                proc.userdata["vad"] = silero.VAD.load()
+
+
+            async def entrypoint(ctx: JobContext):
+                vad = ctx.proc.userdata["vad"].with_options(activation_threshold=0.6)
+                # your agent logic...
+            ```
+
+        Args:
+            min_speech_duration (float): Minimum duration of speech to start a new speech chunk.
+            min_silence_duration (float): At the end of each speech, wait this duration before ending the speech.
+            prefix_padding_duration (float): Duration of padding to add to the beginning of each speech chunk.
+            max_buffered_speech (float): Maximum duration of speech to keep in the buffer (in seconds).
+            activation_threshold (float): Threshold to consider a frame as speech.
+            deactivation_threshold (float): Negative threshold (noise or exit threshold). Default is max(activation_threshold - 0.15, 0.01) when `activation_threshold` is given, else this VAD's value.
+            sample_rate (Literal[8000, 16000]): Sample rate for the inference (only 8KHz and 16KHz are supported).
+
+        Returns:
+            VAD: A new VAD that shares this VAD's ONNX inference session.
+
+        Raises:
+            ValueError: If an unsupported sample rate or a non-positive deactivation threshold is provided.
+        """  # noqa: E501
+        if is_given(sample_rate) and sample_rate not in onnx_model.SUPPORTED_SAMPLE_RATES:
+            raise ValueError("Silero VAD only supports 8KHz and 16KHz sample rates")
+
+        if is_given(deactivation_threshold) and deactivation_threshold <= 0:
+            raise ValueError("deactivation_threshold must be greater than 0")
+
+        if is_given(activation_threshold) and not is_given(deactivation_threshold):
+            deactivation_threshold = _default_deactivation_threshold(activation_threshold)
+
+        opts = replace(self._opts)
+        if is_given(min_speech_duration):
+            opts.min_speech_duration = min_speech_duration
+        if is_given(min_silence_duration):
+            opts.min_silence_duration = min_silence_duration
+        if is_given(prefix_padding_duration):
+            opts.prefix_padding_duration = prefix_padding_duration
+        if is_given(max_buffered_speech):
+            opts.max_buffered_speech = max_buffered_speech
+        if is_given(activation_threshold):
+            opts.activation_threshold = activation_threshold
+        if is_given(deactivation_threshold):
+            opts.deactivation_threshold = deactivation_threshold
+        if is_given(sample_rate):
+            opts.sample_rate = sample_rate
+        return type(self)(session=self._onnx_session, opts=opts)
 
     @property
     def model(self) -> str:
