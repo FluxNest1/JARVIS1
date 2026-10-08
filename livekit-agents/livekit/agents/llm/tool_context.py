@@ -269,12 +269,25 @@ class _BaseFunctionTool(Tool, Generic[_InfoT, _P, _R]):
         if obj is None:
             return self
 
+        sig = inspect.signature(self._func)
+        params = list(sig.parameters.values())
+        # Only functions declared in a class body are instance methods. A free function
+        # assigned to a class attribute also invokes this descriptor, but its first
+        # parameter remains a tool argument regardless of its name. __qualname__ keeps
+        # the lexical class for methods, including inherited and nested-class methods.
+        function_qualname = getattr(self._func, "__qualname__", "")
+        declaring_class = function_qualname.rpartition(".")[0]
+        is_method = objtype is not None and any(
+            cls.__qualname__ == declaring_class and cls.__module__ == self._func.__module__
+            for cls in objtype.__mro__
+        )
+        if not params or not is_method:
+            return self
+
         # bind the tool to an instance
         bound_tool = self.__class__(self._func, self._info, instance=obj)
-        sig = inspect.signature(self._func)
         # skip the instance parameter (e.g. usually the 'self')
-        params = list(sig.parameters.values())[1:]
-        bound_tool.__signature__ = sig.replace(parameters=params)  # type: ignore[attr-defined]
+        bound_tool.__signature__ = sig.replace(parameters=params[1:])  # type: ignore[attr-defined]
         return bound_tool
 
     def __call__(self, *args: _P.args, **kwargs: _P.kwargs) -> _R:
